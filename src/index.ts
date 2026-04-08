@@ -5,682 +5,337 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 // =============================================================================
-// Server Instructions — 이것이 코딩버디의 두뇌. Claude의 행동 자체를 바꾼다.
-// 두 글의 37개 액션아이템을 전부 Claude 행동 규칙으로 인코딩.
+// MCP Instructions — 극도로 짧게. 매 턴 system prompt 토큰으로 잡힌다.
 // =============================================================================
 
 const INSTRUCTIONS = `
-You have a Coding Buddy. A UserPromptSubmit hook injects IMPORTANT hints before each message.
-You MUST follow every IMPORTANT hint from the hook — they come from the user's configured rules.
-
-Additionally, follow these rules while working:
-
-## 비용 최적화
-- Output은 input보다 5배 비싸다 ($75 vs $15/1M). 응답을 짧게 유지하라.
-- 파일 전체를 읽지 말고 필요한 섹션만 읽어라.
-- 불필요한 요약을 하지 마라 ("제가 한 작업을 정리하면..." 금지).
-- Thinking 토큰도 output 단가로 과금된다. 단순 작업에 과도한 사고는 낭비다.
-
-## 캐시 보호
-- 5분 자리비움 후 복귀 시 → "캐시가 만료됐을 수 있습니다"
-- 네트워크 불안정 시 → "큰 작업은 피하세요. 타임아웃→재시도→이중과금 가능"
-
-## 세션 관리
-- 작업 완료 후 → "/clear 또는 새 세션을 추천합니다"
-- 대화 길어지면 → "/compact 한번 해주세요"
-- 5분 이내 이어하기 → "claude --resume latest"
-- 두 가지 방향 시도 → 세션 fork 제안
-- /cost 로 비용 확인 주기적으로 안내
-
-## 압축 생존
-- 메시지에 todo:, next:, pending: 키워드 사용 (압축 후에도 보존됨)
-- 파일 경로를 정확히 언급 (src/auth/login.ts 형태, 최대 8개 보존됨)
-
-## 생산성
-- 독립적 다중 작업 → 서브에이전트로 병렬 실행
-- 코드 변경 완료 후 → "/diff → /commit → /pr 파이프라인" 안내
-- CLAUDE.md 없는 프로젝트 → setup_project 도구 호출 또는 /init 제안
-- 권한 모드: 리뷰=read-only, 개발=workspace-write
-- settings.json에 자주 쓰는 도구 자동 허용 안내
-- 필요한 MCP만 켜라 (각 MCP 도구 정의가 매 요청 토큰 차지)
+비용 최적화 코딩 버디. 다음 규칙을 따라라:
+1. 구체적이지 않은 요청(파일 경로/함수명/에러 없음)은 먼저 구체화를 요청
+2. 작업 시작 전 analyze_task 도구로 적절한 모델과 접근법을 확인
+3. 작업 완료 후 "/cost로 비용 확인" 안내
+4. 주제가 바뀌면 새 세션 안내 ("한 세션 한 작업이 비용과 품질 모두 유리합니다")
 `;
 
 // =============================================================================
-// Task Complexity Analysis — 작업 복잡도 판단 로직
+// 복잡도 분석 헬퍼
 // =============================================================================
 
 const SIMPLE_KEYWORDS = [
-  // English
   "rename", "typo", "format", "formatting", "delete line", "remove line",
   "add import", "simple", "quick", "small", "trivial", "boilerplate",
-  "template", "copy", "move file", "what is", "where is", "show me",
-  "explain this", "change name", "fix typo", "add comment",
-  // Korean
-  "오타", "이름 변경", "이름변경", "포맷", "간단", "삭제", "뭐야", "어디",
-  "보여줘", "설명해", "주석", "임포트", "복사",
+  "template", "copy", "move file", "change name", "fix typo", "add comment",
+  "오타", "이름 변경", "이름변경", "포맷", "간단", "삭제", "주석", "임포트", "복사",
 ];
 
 const COMPLEX_KEYWORDS = [
-  // English
   "migrate", "migration", "architecture", "redesign", "refactor entire",
   "refactor all", "system design", "all files", "entire project",
   "multi-file", "cross-cutting", "overhaul", "rewrite", "restructure",
   "database schema", "auth system", "from scratch",
-  // Korean
   "마이그레이션", "아키텍처", "전체 리팩토링", "시스템 설계", "전부",
   "전체 구조", "다시 만들", "데이터베이스 스키마", "인증 시스템",
 ];
 
 type Complexity = "simple" | "medium" | "complex";
 
-interface ModelRecommendation {
-  model: string;
-  reason_ko: string;
-  reason_en: string;
-  switch_command: string;
-  estimated_cost_range: string;
-  input_price: string;
-  output_price: string;
-}
-
-interface TaskAnalysis {
-  complexity: Complexity;
-  model: ModelRecommendation;
-  approach: string[];
-  warnings: string[];
-  tips: string[];
-}
-
 function analyzeComplexity(task: string): Complexity {
   const lower = task.toLowerCase();
-
   if (COMPLEX_KEYWORDS.some((k) => lower.includes(k))) return "complex";
   if (SIMPLE_KEYWORDS.some((k) => lower.includes(k))) return "simple";
-
-  // Heuristic: multiple numbered items suggest multi-step = complex
   const numberedItems = (task.match(/\d+[\.\)]/g) || []).length;
   if (numberedItems >= 3) return "complex";
-
-  // Long descriptions tend toward complexity
   if (task.length > 300) return "complex";
   if (task.length < 80) return "simple";
-
   return "medium";
 }
 
-function getModelRecommendation(complexity: Complexity): ModelRecommendation {
-  switch (complexity) {
-    case "simple":
-      return {
-        model: "haiku",
-        reason_ko:
-          "단순 작업입니다. Haiku는 Sonnet 대비 input 15배, output 15배 저렴합니다.",
-        reason_en:
-          "Simple task. Haiku is 15x cheaper than Sonnet for both input and output.",
-        switch_command: "/model haiku",
-        estimated_cost_range: "$0.01 - $0.05",
-        input_price: "$1.00 / 1M tokens",
-        output_price: "$5.00 / 1M tokens",
-      };
-    case "complex":
-      return {
-        model: "opus",
-        reason_ko:
-          "복잡한 추론이 필요합니다. Opus를 추천하며, Plan Mode를 먼저 사용하세요.",
-        reason_en:
-          "Deep reasoning required. Opus recommended. Use Plan Mode first.",
-        switch_command: "/model opus",
-        estimated_cost_range: "$2.00 - $10.00",
-        input_price: "$15.00 / 1M tokens",
-        output_price: "$75.00 / 1M tokens",
-      };
-    default:
-      return {
-        model: "sonnet",
-        reason_ko:
-          "표준 개발 작업입니다. Sonnet이 성능과 비용의 최적 균형입니다.",
-        reason_en:
-          "Standard development task. Sonnet is the best balance of capability and cost.",
-        switch_command: "/model sonnet",
-        estimated_cost_range: "$0.20 - $1.00",
-        input_price: "$15.00 / 1M tokens",
-        output_price: "$75.00 / 1M tokens",
-      };
-  }
-}
-
-function getApproach(complexity: Complexity, task: string): string[] {
-  const approaches: string[] = [];
-
-  if (complexity === "complex") {
-    approaches.push(
-      "Plan Mode first: 먼저 /plan 으로 영향받는 파일을 파악한 후 실행하세요"
-    );
-  }
-
-  // Multiple independent subtasks → parallel sub-agents
-  const multiTaskPatterns = [
-    /\d+\.\s/,
-    /and also/i,
-    /additionally/i,
-    /그리고/,
-    /또한/,
-    /동시에/,
-    /병렬/,
-  ];
-  if (multiTaskPatterns.some((p) => p.test(task))) {
-    approaches.push(
-      "Sub-agents: 독립적인 하위 작업을 병렬로 실행하면 속도가 빨라집니다"
-    );
-  }
-
-  // No file path detected → need specifics
-  const hasFilePath = /[\w-]+\/[\w.-]+\.\w{1,5}/.test(task);
-  if (!hasFilePath && complexity !== "simple") {
-    approaches.push(
-      "Specificity needed: 구체적인 파일 경로를 지정하면 도구 호출이 줄어듭니다"
-    );
-  }
-
-  if (approaches.length === 0) {
-    approaches.push(
-      "Direct implementation: 작업 범위가 명확합니다. 바로 진행 가능합니다"
-    );
-  }
-
-  return approaches;
-}
-
-function getWarnings(
-  complexity: Complexity,
-  currentModel?: string,
-  sessionMinutes?: number,
-  messageCount?: number
-): string[] {
-  const warnings: string[] = [];
-  const rec = getModelRecommendation(complexity);
-
-  // Model mismatch warning
-  if (currentModel) {
-    const current = currentModel.toLowerCase();
-    if (rec.model !== current) {
-      warnings.push(
-        `현재 ${current} 모델인데, 이 작업은 ${rec.model}이 적합합니다. ` +
-          `단, 세션 중간에 모델을 바꾸면 캐시가 깨집니다. 새 세션에서 ${rec.switch_command} 를 사용하세요.`
-      );
-    }
-  }
-
-  // Session too long
-  if (sessionMinutes && sessionMinutes > 30) {
-    warnings.push(
-      "세션이 30분 이상 진행됐습니다. /compact 또는 새 세션을 고려하세요."
-    );
-  }
-
-  // Many messages = expensive context
-  if (messageCount && messageCount > 20) {
-    warnings.push(
-      `대화가 ${messageCount}개 메시지로 길어졌습니다. 매 턴마다 전체 대화가 전송되므로 비용이 누적됩니다. /compact 또는 /clear 를 추천합니다.`
-    );
-  }
-
-  // Complex task without plan
-  if (complexity === "complex") {
-    warnings.push(
-      "복잡한 작업은 Plan Mode에서 먼저 계획을 세우면 잘못된 방향으로 작업한 후 되돌리는 낭비를 줄일 수 있습니다."
-    );
-  }
-
-  return warnings;
-}
-
-function getTips(complexity: Complexity, task: string): string[] {
-  const tips: string[] = [];
-
-  if (complexity === "simple") {
-    tips.push(
-      "이 작업에는 extended thinking이 불필요합니다. thinking 토큰은 output 단가($75/1M)로 청구됩니다."
-    );
-  }
-
-  // Remind about compaction keywords
-  tips.push(
-    'todo/next/pending 키워드를 메시지에 포함하면 자동 압축 후에도 맥락이 보존됩니다.'
-  );
-
-  // File path reminder
-  if (!/[\w-]+\/[\w.-]+\.\w{1,5}/.test(task)) {
-    tips.push(
-      "파일 경로를 정확히 언급하면 (예: src/auth/login.ts) 압축 후에도 Claude가 기억합니다."
-    );
-  }
-
-  return tips;
+function hasFilePath(task: string): boolean {
+  return /[\w-]+\/[\w.-]+\.\w{1,5}/.test(task);
 }
 
 // =============================================================================
-// MCP Server 생성
+// MCP Server
 // =============================================================================
 
 const server = new McpServer(
-  {
-    name: "coding-buddy",
-    version: "1.0.0",
-  },
-  {
-    instructions: INSTRUCTIONS,
-  }
+  { name: "coding-buddy", version: "2.0.0" },
+  { instructions: INSTRUCTIONS }
 );
 
 // =============================================================================
-// Tool: analyze_task — 작업 복잡도 분석 → 모델 + 전략 추천
-// 매 새 작업 시작 시 Claude가 자동으로 호출
+// Tool 1: analyze_task — 복잡도/모델/비용 추정 (온디맨드)
 // =============================================================================
 
 server.tool(
   "analyze_task",
-  "Analyze task complexity and recommend the optimal model, approach, and estimated cost. Call this at the start of each new task.",
+  "Analyze task complexity and recommend optimal model, approach, and estimated cost. Call this before starting any new task.",
   {
-    task: z
-      .string()
-      .describe("Description of the task the user wants to accomplish"),
-    current_model: z
-      .string()
-      .optional()
-      .describe("Currently active model (haiku, sonnet, or opus)"),
-    session_age_minutes: z
-      .number()
-      .optional()
-      .describe("Minutes since session started"),
-    message_count: z
-      .number()
-      .optional()
-      .describe("Number of messages in the current conversation"),
+    task: z.string().describe("Description of the task"),
   },
-  async ({
-    task,
-    current_model,
-    session_age_minutes,
-    message_count,
-  }): Promise<{ content: Array<{ type: "text"; text: string }> }> => {
+  async ({ task }): Promise<{ content: Array<{ type: "text"; text: string }> }> => {
     const complexity = analyzeComplexity(task);
-    const model = getModelRecommendation(complexity);
-    const approach = getApproach(complexity, task);
-    const warnings = getWarnings(
-      complexity,
-      current_model,
-      session_age_minutes,
-      message_count
-    );
-    const tips = getTips(complexity, task);
+    const specific = hasFilePath(task);
 
-    const analysis: TaskAnalysis = {
+    const models: Record<Complexity, { model: string; price: string; cost_range: string }> = {
+      simple: { model: "haiku", price: "$1/$5 per 1M", cost_range: "$0.01-$0.05" },
+      medium: { model: "sonnet", price: "$15/$75 per 1M", cost_range: "$0.20-$1.00" },
+      complex: { model: "opus", price: "$15/$75 per 1M", cost_range: "$2.00-$10.00" },
+    };
+
+    const rec = models[complexity];
+    const tips: string[] = [];
+
+    if (!specific) {
+      tips.push("파일 경로를 명시하면 도구 호출 횟수가 줄어듭니다 (비용 절감)");
+    }
+    if (complexity === "complex") {
+      tips.push("Plan Mode에서 먼저 계획을 세우면 불필요한 탐색을 줄일 수 있습니다");
+    }
+    if (complexity === "simple") {
+      tips.push("Extended thinking이 불필요합니다. thinking 토큰은 output 단가($75/1M)로 과금됩니다");
+    }
+
+    const result = {
       complexity,
-      model,
-      approach,
-      warnings,
+      recommended_model: rec.model,
+      model_price: rec.price,
+      estimated_cost: rec.cost_range,
+      is_specific: specific,
+      approach: complexity === "complex" ? "plan_mode_first" : "direct",
       tips,
+      switch_note: `현재 모델이 ${rec.model}이 아니라면 새 세션에서 /model ${rec.model} 로 시작하세요. 세션 중 모델 변경은 캐시 브레이크(비용 10배)를 유발합니다.`,
     };
 
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(analysis, null, 2),
-        },
-      ],
-    };
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   }
 );
 
 // =============================================================================
-// Tool: setup_project — 프로젝트 설정 최적화 추천
-// CLAUDE.md, 권한, hooks, settings.json 종합 안내
-// =============================================================================
-
-server.tool(
-  "setup_project",
-  "Get comprehensive Claude Code project setup recommendations: CLAUDE.md structure, permissions, hooks, and settings optimization.",
-  {
-    has_claude_md: z
-      .boolean()
-      .describe("Whether the project has a CLAUDE.md file"),
-    project_type: z
-      .string()
-      .optional()
-      .describe(
-        "Project type: react, nextjs, rust, python, go, monorepo, etc."
-      ),
-    team_size: z
-      .number()
-      .optional()
-      .describe("Number of developers working on this project"),
-    current_permission_mode: z
-      .string()
-      .optional()
-      .describe("Current permission mode: prompt, read-only, workspace-write, danger-full-access"),
-  },
-  async ({
-    has_claude_md,
-    project_type,
-    team_size,
-    current_permission_mode,
-  }): Promise<{ content: Array<{ type: "text"; text: string }> }> => {
-    const recommendations: Array<{
-      priority: string;
-      category: string;
-      action: string;
-      detail: string;
-      cost_impact: string;
-    }> = [];
-
-    // --- CLAUDE.md ---
-    if (!has_claude_md) {
-      recommendations.push({
-        priority: "HIGH",
-        category: "CLAUDE.md",
-        action: "Create CLAUDE.md with /init",
-        detail: `Run /init to create CLAUDE.md, then add:
-
-## Include in CLAUDE.md:
-- Project structure (directories and their purpose)
-- Build/test/lint commands
-- Coding conventions (error handling, naming, commit style)
-- Common file paths (routes, components, types, configs)
-
-## Hierarchical structure (saves tokens by loading only relevant context):
-project/
-  CLAUDE.md              # Project-wide rules
-  CLAUDE.local.md        # Personal env (gitignored)
-  src/
-    CLAUDE.md            # src-specific context
-  tests/
-    CLAUDE.md            # test-specific context
-
-## Example:
-\`\`\`markdown
-# Project Structure
-- src/api/: REST API routes (Express)
-- src/components/: React components (Atomic Design)
-- src/types/: TypeScript type definitions
-
-# Commands
-- Test: pnpm test
-- Lint: pnpm lint
-- Build: pnpm build
-
-# Conventions
-- Error handling: use Result type, no try-catch
-- Commits: conventional commits (feat:, fix:, chore:)
-\`\`\``,
-        cost_impact:
-          "Saves ~$0.10-0.50 per session by eliminating repeated project explanations",
-      });
-
-      recommendations.push({
-        priority: "MEDIUM",
-        category: "CLAUDE.local.md",
-        action: "Create CLAUDE.local.md for personal environment",
-        detail: `Create CLAUDE.local.md (add to .gitignore):
-- Local database connection strings
-- Your branch naming convention
-- Personal preferences
-- PR reviewer defaults`,
-        cost_impact: "Prevents personal config from polluting team CLAUDE.md",
-      });
-    } else {
-      recommendations.push({
-        priority: "LOW",
-        category: "CLAUDE.md",
-        action: "Review CLAUDE.md for completeness",
-        detail:
-          "Ensure it includes: project structure, commands, conventions, common paths. Edit BEFORE starting a session (editing mid-session breaks cache).",
-        cost_impact:
-          "Well-structured CLAUDE.md reduces repeated explanations",
-      });
-    }
-
-    // --- Permission mode ---
-    if (!current_permission_mode || current_permission_mode === "prompt") {
-      recommendations.push({
-        priority: "HIGH",
-        category: "Permissions",
-        action: "Optimize permission mode and auto-allow list",
-        detail: `Every permission prompt interrupts flow and wastes time.
-
-## Option 1: Permission mode flag
-- Code review only: claude --permission-mode read-only
-- Active development: claude --permission-mode workspace-write
-
-## Option 2: Auto-allow common tools in settings.json
-Add to .claude/settings.json:
-{
-  "permissions": {
-    "allow": [
-      "Read",
-      "Edit",
-      "Write",
-      "Glob",
-      "Grep",
-      "Bash(git *)",
-      "Bash(npm *)",
-      "Bash(pnpm *)",
-      "Bash(cargo *)"
-    ]
-  }
-}
-
-This auto-approves safe operations while still prompting for dangerous ones (rm, curl, etc).`,
-        cost_impact:
-          "No direct token savings, but eliminates workflow interruptions",
-      });
-    }
-
-    // --- Hooks ---
-    recommendations.push({
-      priority: "MEDIUM",
-      category: "Hooks",
-      action: "Set up automation hooks",
-      detail: `Add to .claude/settings.json for automatic formatting and safety:
-
-{
-  "hooks": {
-    "postToolUse": [
-      {
-        "matcher": "Edit",
-        "command": "${project_type === "rust" ? "cargo fmt -- $HOOK_TOOL_INPUT 2>/dev/null; exit 0" : "npx prettier --write $HOOK_TOOL_INPUT 2>/dev/null; exit 0"}"
-      }
-    ],
-    "preToolUse": [
-      {
-        "matcher": "Bash",
-        "command": "echo $HOOK_TOOL_INPUT | grep -qE 'rm -rf|drop table|force push' && exit 2 || exit 0"
-      }
-    ]
-  }
-}
-
-Hook exit codes: 0=allow, 2=block, other=fail`,
-      cost_impact:
-        "Prevents costly mistakes (accidental deletions, force pushes)",
-    });
-
-    // --- MCP optimization ---
-    recommendations.push({
-      priority: "MEDIUM",
-      category: "MCP",
-      action: "Audit active MCP servers",
-      detail: `Each MCP server's tool definitions are sent with EVERY API request, consuming tokens.
-
-Rules:
-- Only enable MCPs you actively use
-- Set up ALL needed MCPs BEFORE starting a session (adding/removing = cache break)
-- MCP initialization timeout: 10s, tool list timeout: 30s — unstable servers hurt performance
-
-Check current MCPs: /mcp`,
-      cost_impact:
-        "Removing 1 unused MCP with 5 tools saves ~100-200 tokens per request",
-    });
-
-    // --- Session strategy ---
-    recommendations.push({
-      priority: "HIGH",
-      category: "Session Strategy",
-      action: "Adopt one-session-one-task discipline",
-      detail: `Session management rules:
-1. One session = one focused task
-2. Task done → /clear or new session
-3. Conversation long → /compact (or set CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS=50000 for earlier auto-compact)
-4. Resume within 5 min: claude --resume latest (cache alive)
-5. Want two approaches: use session fork
-6. Monitor costs: /cost
-
-Important keywords that survive compaction: todo, next, pending, follow up, remaining
-File paths with extensions (e.g., src/auth/login.ts) also survive compaction.`,
-      cost_impact:
-        "Short focused sessions maximize cache hits and minimize context bloat",
-    });
-
-    // --- Team collaboration ---
-    if (team_size && team_size > 1) {
-      recommendations.push({
-        priority: "MEDIUM",
-        category: "Team",
-        action: "Set up team-wide CLAUDE.md with CLAUDE.local.md split",
-        detail: `For teams:
-- CLAUDE.md: shared conventions, commands, structure (committed to git)
-- CLAUDE.local.md: personal env, preferences (gitignored)
-
-Add to .gitignore:
-CLAUDE.local.md`,
-        cost_impact:
-          "Consistent behavior across team members, personal overrides without conflicts",
-      });
-    }
-
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify({ recommendations }, null, 2),
-        },
-      ],
-    };
-  }
-);
-
-// =============================================================================
-// Tool: cost_reference — 비용 참조 테이블
-// 모델별 단가, 토큰 비율, 캐시 설정, 캐시 브레이커 등
+// Tool 2: cost_reference — 가격표/캐시/팁 조회 (온디맨드)
 // =============================================================================
 
 server.tool(
   "cost_reference",
-  "Get Claude Code model pricing, token ratios, cache settings, and cost optimization reference data.",
-  {},
-  async (): Promise<{ content: Array<{ type: "text"; text: string }> }> => {
-    const reference = {
-      pricing_per_1M_tokens: {
-        haiku: {
-          input: "$1.00",
-          output: "$5.00",
-          cache_write: "$1.25",
-          cache_read: "$0.10",
-        },
-        sonnet: {
-          input: "$15.00",
-          output: "$75.00",
-          cache_write: "$18.75",
-          cache_read: "$1.50",
-        },
-        opus: {
-          input: "$15.00",
-          output: "$75.00",
-          cache_write: "$18.75",
-          cache_read: "$1.50",
-        },
+  "Get Claude Code pricing, cache settings, and cost optimization tips by topic.",
+  {
+    topic: z.enum(["pricing", "cache", "compaction", "thinking", "all"]).optional().describe("Topic to query. Defaults to 'all'."),
+  },
+  async ({ topic }): Promise<{ content: Array<{ type: "text"; text: string }> }> => {
+    const t = topic || "all";
+    const sections: Record<string, object> = {
+      pricing: {
+        haiku: { input: "$1", output: "$5", cache_write: "$1.25", cache_read: "$0.10" },
+        sonnet: { input: "$15", output: "$75", cache_write: "$18.75", cache_read: "$1.50" },
+        opus: { input: "$15", output: "$75", cache_write: "$18.75", cache_read: "$1.50" },
+        unit: "USD per 1M tokens",
+        key_insight: "output은 input보다 5배 비쌈. cache_read는 input보다 10배 저렴.",
       },
-
-      cost_ratios: {
-        output_vs_input: "Output is 5x more expensive than input",
-        cache_read_vs_input:
-          "Cache read is 10x cheaper than input",
-        haiku_vs_sonnet:
-          "Haiku is 15x cheaper than Sonnet (both input and output)",
-        thinking_tokens:
-          "Thinking/extended thinking tokens are billed as OUTPUT ($75/1M for Sonnet/Opus)",
+      cache: {
+        prompt_ttl: "300초 (5분) — Anthropic 서버 캐시",
+        completion_ttl: "30초 — 동일 요청 로컬 캐시",
+        breakers: ["모델 변경", "CLAUDE.md 수정", "MCP 도구 변경", "시스템 프롬프트 변경"],
+        tip: "5분 이상 자리비움 → 캐시 만료 → 첫 요청 비용 증가",
       },
-
-      cache_config: {
-        completion_cache_ttl: "30 seconds (exact duplicate request reuse, stored locally)",
-        prompt_cache_ttl:
-          "300 seconds (5 minutes — Anthropic server-side cache)",
-        cache_break_threshold:
-          "2,000+ token drop in cache_read signals a cache break",
-      },
-
-      cache_breakers: [
-        "Model change mid-session (model_hash changes)",
-        "CLAUDE.md edit during session (system_hash changes)",
-        "MCP server add/remove during session (tools_hash changes)",
-        "Any system prompt modification",
-      ],
-
       compaction: {
-        auto_threshold:
-          "100,000 input tokens (configurable: CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS)",
-        manual_command: "/compact",
-        surviving_keywords: [
-          "todo",
-          "next",
-          "pending",
-          "follow up",
-          "remaining",
-        ],
-        surviving_paths:
-          "File paths with / separator and known extensions (.ts, .js, .rs, .py, .json, .md) — max 8 paths preserved",
-        multi_compaction:
-          "Previous summaries are merged, not discarded ('Previously compacted context')",
+        threshold: "100,000 input tokens (CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS로 조정)",
+        surviving_keywords: ["todo", "next", "pending", "follow up", "remaining"],
+        surviving_paths: "파일 경로 (/ 포함 + 확장자) 최대 8개",
+        tip: "한 세션 한 작업. 길어지면 /compact. 마무리되면 새 세션.",
       },
-
-      retry_config: {
-        max_retries: "2 (total 3 attempts)",
-        initial_backoff: "200ms",
-        max_backoff: "2 seconds",
-        retried_status_codes: "429, 500, 502, 503, 529",
-        cost_note:
-          "429/502/503 = no charge (rejected before processing). 500/timeout = possible partial charge.",
+      thinking: {
+        billing: "output 토큰으로 과금 ($75/1M for Sonnet/Opus)",
+        risk: "단순 작업에 thinking 8,000토큰 → $0.60 낭비",
+        tip: "단순 작업은 Haiku (thinking 없음). 복잡한 추론에만 Opus.",
       },
+    };
 
-      token_estimation: {
-        method: "JSON serialized bytes ÷ 4",
-        billed_per_request:
-          "messages + system prompt + tool definitions + tool_choice — ALL sent every turn",
-      },
+    const result = t === "all" ? sections : { [t]: sections[t] };
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  }
+);
 
-      quick_tips: [
-        "Output 1M tokens saved = $75 saved. Input 1M tokens saved = $15 saved. Prioritize reducing output.",
-        "Keep sessions under 30 min for optimal cache utilization",
-        "One session = one task. Short focused sessions > long wandering ones.",
-        "/cost to monitor, /compact to compress, /clear to reset",
-        "Cafe WiFi? Avoid large operations. Timeout → retry → possible double billing.",
-      ],
+// =============================================================================
+// Tool 3: session_health — 세션 상태 진단 (온디맨드)
+// =============================================================================
+
+server.tool(
+  "session_health",
+  "Diagnose current session health and recommend whether to continue, compact, or start a new session.",
+  {
+    message_count: z.number().optional().describe("Approximate number of messages in session"),
+    minutes_since_start: z.number().optional().describe("Minutes since session started"),
+    minutes_since_last_interaction: z.number().optional().describe("Minutes since last user message"),
+    topic_changed: z.boolean().optional().describe("Whether the topic has changed from the original task"),
+  },
+  async ({ message_count, minutes_since_start, minutes_since_last_interaction, topic_changed }): Promise<{ content: Array<{ type: "text"; text: string }> }> => {
+    let recommendation: "continue" | "compact" | "new_session" = "continue";
+    const warnings: string[] = [];
+
+    if (topic_changed) {
+      recommendation = "new_session";
+      warnings.push("주제가 바뀌었습니다. 새 세션이 비용과 품질 모두 유리합니다.");
+    }
+
+    if (message_count && message_count > 20) {
+      recommendation = recommendation === "new_session" ? "new_session" : "compact";
+      warnings.push(`${message_count}개 메시지 누적. 매 턴 전체 대화가 전송되어 비용이 증가 중.`);
+    }
+
+    if (minutes_since_start && minutes_since_start > 30) {
+      warnings.push("30분+ 세션. 압축이 누적되어 맥락 손실 위험.");
+    }
+
+    if (minutes_since_last_interaction && minutes_since_last_interaction > 5) {
+      warnings.push("5분+ 미응답. Anthropic 서버 캐시가 만료됐을 가능성 높음. 첫 요청 비용 증가.");
+    }
+
+    const actions: Record<string, string> = {
+      continue: "현재 세션 계속 진행",
+      compact: "/compact 로 대화 압축 후 계속",
+      new_session: "새 세션 시작 추천",
     };
 
     return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(reference, null, 2),
-        },
-      ],
+      content: [{
+        type: "text" as const,
+        text: JSON.stringify({
+          recommendation,
+          action: actions[recommendation],
+          warnings,
+          tips: [
+            "claude --resume latest 로 5분 이내 이어하기 가능",
+            "중요 맥락은 CLAUDE.md에 저장 (압축과 무관하게 보존)",
+          ],
+        }, null, 2),
+      }],
     };
   }
 );
 
 // =============================================================================
-// Start the server
+// Tool 4: optimize_prompt — 모호한 프롬프트 최적화 제안 (온디맨드)
+// =============================================================================
+
+server.tool(
+  "optimize_prompt",
+  "Analyze a vague user prompt and suggest an optimized version that reduces tool calls and cost.",
+  {
+    user_prompt: z.string().describe("The user's original prompt to optimize"),
+  },
+  async ({ user_prompt }): Promise<{ content: Array<{ type: "text"; text: string }> }> => {
+    const issues: string[] = [];
+    const specific = hasFilePath(user_prompt);
+
+    if (!specific) {
+      issues.push("파일 경로 없음 → 탐색 도구 5~10회 예상");
+    }
+
+    const lower = user_prompt.toLowerCase();
+    if (lower.includes("전체") || lower.includes("entire") || lower.includes("all")) {
+      issues.push("범위가 '전체' → 대량 파일 읽기 발생");
+    }
+    if (!lower.match(/함수|function|컴포넌트|component|클래스|class|메서드|method/)) {
+      issues.push("함수/컴포넌트 지정 없음 → 파일 전체 읽기 필요");
+    }
+
+    const vague_cost = "$1.00-$5.00 (4+턴, 10+ 도구 호출)";
+    const specific_cost = "$0.10-$0.30 (1-2턴, 1-2 도구 호출)";
+
+    return {
+      content: [{
+        type: "text" as const,
+        text: JSON.stringify({
+          original: user_prompt,
+          issues,
+          optimization_tips: [
+            "파일 경로를 추가하세요 (예: src/auth/login.ts)",
+            "함수명이나 컴포넌트명을 지정하세요",
+            "에러 메시지가 있다면 포함하세요",
+            "증상을 구체적으로 설명하세요",
+          ],
+          estimated_cost: { vague: vague_cost, specific: specific_cost },
+          example: {
+            before: "버그 찾아줘",
+            after: "src/routes/auth.ts의 login 함수에서 세션 만료 처리가 안 됨. 로그아웃 후에도 세션이 유지됨.",
+          },
+        }, null, 2),
+      }],
+    };
+  }
+);
+
+// =============================================================================
+// Tool 5: setup_project — 프로젝트 설정 생성 (온디맨드)
+// =============================================================================
+
+server.tool(
+  "setup_project",
+  "Generate optimized Claude Code project configuration: CLAUDE.md structure, permissions, and hooks.",
+  {
+    project_type: z.string().optional().describe("Project type: react, nextjs, rust, python, go, monorepo"),
+    has_claude_md: z.boolean().optional().describe("Whether project has CLAUDE.md"),
+    team_size: z.number().optional().describe("Number of developers"),
+  },
+  async ({ project_type, has_claude_md, team_size }): Promise<{ content: Array<{ type: "text"; text: string }> }> => {
+    const type = project_type || "unknown";
+    const formatter = type === "rust" ? "cargo fmt" : "npx prettier --write";
+    const test_cmd = type === "rust" ? "cargo test" : type === "python" ? "pytest" : "pnpm test";
+    const lint_cmd = type === "rust" ? "cargo clippy" : type === "python" ? "ruff check" : "pnpm lint";
+
+    const result: Record<string, unknown> = {};
+
+    if (!has_claude_md) {
+      result.claude_md = {
+        structure: [
+          "project/CLAUDE.md — 프로젝트 전체 규칙",
+          "project/CLAUDE.local.md — 개인 환경 (gitignored)",
+          "project/src/CLAUDE.md — src 하위 작업 시 추가 컨텍스트",
+          "project/tests/CLAUDE.md — 테스트 작업 시 추가 컨텍스트",
+        ],
+        template: `# Project\n\n## Structure\n- src/: source code\n\n## Commands\n- Test: ${test_cmd}\n- Lint: ${lint_cmd}\n\n## Conventions\n- Commit: conventional commits (feat:, fix:, chore:)`,
+        local_template: "# Personal\n- Branch naming: yourname/feature-name",
+        tip: ".gitignore에 CLAUDE.local.md 추가",
+      };
+    }
+
+    result.settings = {
+      permissions: {
+        allow: [
+          "Read", "Edit", "Write", "Glob", "Grep",
+          "Bash(git *)", `Bash(${type === "rust" ? "cargo *" : "pnpm *"})`,
+        ],
+      },
+      hooks: {
+        PostToolUse: [{
+          matcher: "Edit",
+          hooks: [{ type: "command", command: `${formatter} $HOOK_TOOL_INPUT 2>/dev/null; exit 0` }],
+        }],
+        PreToolUse: [{
+          matcher: "Bash",
+          hooks: [{ type: "command", command: "echo $HOOK_TOOL_INPUT | grep -qE 'rm -rf|drop table|force push' && exit 2 || exit 0" }],
+        }],
+      },
+    };
+
+    result.cost_tips = [
+      "CLAUDE.md는 세션 시작 전에 수정 (세션 중 수정 = 캐시 브레이크)",
+      "MCP 서버는 세션 시작 전에 설정 (도구 변경 = 캐시 브레이크)",
+      "필요한 MCP만 활성화 (각 도구 정의가 매 턴 토큰 차지)",
+    ];
+
+    if (team_size && team_size > 1) {
+      result.team = {
+        shared: "CLAUDE.md (git tracked) — 팀 공통 규칙",
+        personal: "CLAUDE.local.md (gitignored) — 개인 설정",
+      };
+    }
+
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+// =============================================================================
+// Start
 // =============================================================================
 
 async function main() {
