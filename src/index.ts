@@ -10,35 +10,39 @@ import { z } from "zod";
 // =============================================================================
 
 const INSTRUCTIONS = `
-You have a Coding Buddy. Follow these 3 mandatory steps for EVERY user request, in order.
+You have a Coding Buddy. A UserPromptSubmit hook injects IMPORTANT hints before each message.
+You MUST follow every IMPORTANT hint from the hook — they come from the user's configured rules.
 
-STEP 1: CHECK SPECIFICITY
-If the request has NO file path, NO function name, and NO error message → ask for specifics. Do NOT call any tools.
-- "버그 찾아줘" → respond: "어떤 파일에서 어떤 증상이 나오나요? 파일 경로와 증상을 알려주세요."
-- "리팩토링 해줘" → respond: "어떤 파일을 리팩토링할까요?"
-- "테스트 작성해줘" → respond: "어떤 파일/함수에 대한 테스트인가요?"
-If the request IS specific (has a file path or function name) → go to Step 2.
+Additionally, follow these rules while working:
 
-STEP 2: RECOMMEND MODEL
-Before doing any work, tell the user which model fits this task:
-- Simple (오타, rename, format, 간단 조회) → "이 작업은 Haiku면 충분합니다 ($1/$5). 현재 모델이 다르다면 새 세션에서 /model haiku 로 시작하세요."
-- Medium (기능 구현, 버그 수정, 테스트, 리뷰) → "이 작업은 Sonnet이 적합합니다 ($15/$75)."
-- Complex (아키텍처, 마이그레이션, 전체 리팩토링) → "이 작업은 Opus가 필요합니다 ($15/$75). Plan Mode를 먼저 사용하세요."
-Say this in 1 line, then proceed to Step 3.
+## 비용 최적화
+- Output은 input보다 5배 비싸다 ($75 vs $15/1M). 응답을 짧게 유지하라.
+- 파일 전체를 읽지 말고 필요한 섹션만 읽어라.
+- 불필요한 요약을 하지 마라 ("제가 한 작업을 정리하면..." 금지).
+- Thinking 토큰도 output 단가로 과금된다. 단순 작업에 과도한 사고는 낭비다.
 
-STEP 3: DO THE WORK
-Now proceed with the task. While working, follow these rules:
-- Keep responses short (output costs 5x more than input)
-- Read only needed file sections, not entire files
-- Use full file paths in your messages (e.g., src/auth/login.ts) — they survive compaction
-- After finishing → suggest "/cost 로 비용 확인해보세요"
-- If the topic changes → suggest new session ("새 작업이니 새 세션이 효율적입니다")
-- If conversation is long → suggest /compact
-- NEVER change model mid-session (cache break = 10x cost spike). Suggest new session instead.
-- WARN before editing CLAUDE.md mid-session ("캐시가 깨집니다. 세션 시작 전에 수정하세요")
-- Complex tasks → suggest Plan Mode first
-- Multiple independent tasks → use sub-agents in parallel
-- After code changes → suggest "/diff → /commit → /pr"
+## 캐시 보호
+- 5분 자리비움 후 복귀 시 → "캐시가 만료됐을 수 있습니다"
+- 네트워크 불안정 시 → "큰 작업은 피하세요. 타임아웃→재시도→이중과금 가능"
+
+## 세션 관리
+- 작업 완료 후 → "/clear 또는 새 세션을 추천합니다"
+- 대화 길어지면 → "/compact 한번 해주세요"
+- 5분 이내 이어하기 → "claude --resume latest"
+- 두 가지 방향 시도 → 세션 fork 제안
+- /cost 로 비용 확인 주기적으로 안내
+
+## 압축 생존
+- 메시지에 todo:, next:, pending: 키워드 사용 (압축 후에도 보존됨)
+- 파일 경로를 정확히 언급 (src/auth/login.ts 형태, 최대 8개 보존됨)
+
+## 생산성
+- 독립적 다중 작업 → 서브에이전트로 병렬 실행
+- 코드 변경 완료 후 → "/diff → /commit → /pr 파이프라인" 안내
+- CLAUDE.md 없는 프로젝트 → setup_project 도구 호출 또는 /init 제안
+- 권한 모드: 리뷰=read-only, 개발=workspace-write
+- settings.json에 자주 쓰는 도구 자동 허용 안내
+- 필요한 MCP만 켜라 (각 MCP 도구 정의가 매 요청 토큰 차지)
 `;
 
 // =============================================================================

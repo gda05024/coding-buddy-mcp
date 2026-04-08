@@ -1,6 +1,6 @@
 {
   "name": "coding-buddy-mcp",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "A pair programming buddy MCP for Claude Code — optimizes cost and productivity based on Claude Code internals analysis",
   "type": "module",
   "main": "dist/index.js",
