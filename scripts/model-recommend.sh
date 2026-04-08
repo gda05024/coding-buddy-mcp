@@ -28,7 +28,7 @@ elif echo "$LOWER" | grep -qiE 'migrat|마이그레이션|architect|아키텍처
 fi
 
 if [ "$COMPLEXITY" = "complex" ]; then
-  echo "IMPORTANT: 응답에 반드시 다음 2가지를 포함하세요. 첫째: 💡 모델 추천: ${MODEL}. 현재 모델이 다르면 새 세션에서 ${CMD} 을 안내. 둘째: 🗺️ 이 작업은 복잡합니다. Plan Mode에서 먼저 계획을 세운 후 실행하는 것을 권장합니다."
+  echo "IMPORTANT: 응답에 반드시 다음 2가지를 포함하세요. 첫째: 💡 모델 추천: ${MODEL}. 현재 모델이 다르면 새 세션에서 ${CMD} 을 안내. 둘째: 이 작업은 복잡합니다. Plan Mode에서 먼저 계획을 세운 후 실행하는 것을 권장합니다."
 else
   echo "IMPORTANT: 응답 첫 줄에 반드시 포함 → 💡 모델 추천: ${MODEL}. 현재 모델이 다르면 새 세션에서 ${CMD} 을 안내하세요."
 fi
