@@ -25,5 +25,5 @@ elif echo "$LOWER" | grep -qiE 'migrat|마이그레이션|architect|아키텍처
   CMD="/model opus"
 fi
 
-echo "모델 추천: ${MODEL}. 다르면 새 세션에서 ${CMD}. 세션 중 변경은 캐시 브레이크."
+echo "IMPORTANT: 응답 첫 줄에 반드시 포함 → 💡 모델 추천: ${MODEL}. 현재 모델이 다르면 새 세션에서 ${CMD} 을 안내하세요."
 exit 0
