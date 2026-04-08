@@ -63,6 +63,8 @@ fi
 
 if [ "$VAGUE" = false ] && [ "$IS_TASK" = true ]; then
   HINTS="${HINTS}IMPORTANT: 응답 첫 줄에 반드시 포함 → 💡 모델 추천: ${MODEL}. 현재 모델이 다르면 새 세션에서 ${CMD} 을 안내하세요. "
+  # 3.3 파일 경로 명시 + 3.2 압축 생존 키워드
+  HINTS="${HINTS}IMPORTANT: 응답에서 파일을 언급할 때 반드시 전체 경로를 사용하세요 (예: src/auth/login.ts). 미완성 작업이 있으면 'todo:', 'next:', 'pending:' 키워드를 포함하세요. 둘 다 압축 후에도 보존됩니다. "
 fi
 
 # =============================================
