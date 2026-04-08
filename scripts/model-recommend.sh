@@ -57,7 +57,7 @@ fi
 
 # 모호하지 않고, 작업성 프롬프트일 때만 모델 추천
 IS_TASK=false
-if echo "$LOWER" | grep -qiE '해줘|해주세요|수정|추가|만들|삭제|변경|작성|구현|보여|봐줘|읽어|찾아|고쳐|바꿔|올려|fix|add|create|remove|update|write|implement|refactor|migrate|show|read|find|check|설정|분석|검사|확인|review|test|빌드|build|deploy|설명|explain'; then
+if echo "$LOWER" | grep -qiE '해줘|해주세요|수정|추가|만들|삭제|변경|작성|구현|보여|봐줘|읽어|찾아|고쳐|바꿔|올려|fix|add|create|remove|update|write|implement|refactor|migrate|show|read|find|check|설정|분석|검사|확인|review|test|빌드|build|deploy|설명|explain|마이그레이션|migration|리팩토링|아키텍처'; then
   IS_TASK=true
 fi
 
