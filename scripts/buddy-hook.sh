@@ -4,7 +4,17 @@
 
 # stdin에서 JSON 읽기
 INPUT=$(cat)
-PROMPT=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',''))" 2>/dev/null)
+
+# 디버그: 입력 로그
+echo "$INPUT" >> /tmp/coding-buddy-debug.log
+echo "---" >> /tmp/coding-buddy-debug.log
+
+# message 또는 prompt 필드 시도
+PROMPT=$(echo "$INPUT" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+print(d.get('message', d.get('prompt', d.get('content', d.get('text', '')))))
+" 2>/dev/null)
 
 if [ -z "$PROMPT" ]; then
   exit 0
@@ -48,17 +58,9 @@ esac
 
 # 결과 출력 — Claude에게 주입되는 메시지
 if [ "$VAGUE" = true ]; then
-  cat << EOF
-[Coding Buddy] 이 요청은 구체적이지 않습니다.
-작업 전에 반드시 파일 경로와 증상을 먼저 물어보세요.
-모호한 요청에 바로 도구를 호출하면 4+턴, 10+도구 호출 = 비용 낭비입니다.
-EOF
+  echo "IMPORTANT: 이 요청은 구체적이지 않습니다. 도구를 호출하지 말고 파일 경로와 증상을 먼저 물어보세요."
 else
-  cat << EOF
-[Coding Buddy] 모델 추천: ${MODEL_REC}
-현재 모델과 다르다면 새 세션에서 ${MODEL_CMD} 로 시작하는 것을 추천하세요.
-세션 중 모델 변경은 캐시 브레이크(비용 10배)를 유발합니다.
-EOF
+  echo "IMPORTANT: 응답 첫 줄에 반드시 다음을 포함하세요 → 💡 모델 추천: ${MODEL_REC}. 현재 모델이 다르면 새 세션에서 ${MODEL_CMD} 을 안내하세요. 그 다음 작업을 진행하세요."
 fi
 
 exit 0
