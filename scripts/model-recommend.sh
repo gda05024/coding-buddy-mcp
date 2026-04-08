@@ -27,9 +27,19 @@ elif echo "$LOWER" | grep -qiE 'migrat|마이그레이션|architect|아키텍처
   CMD="/model opus"
 fi
 
-if [ "$COMPLEXITY" = "complex" ]; then
-  echo "IMPORTANT: 응답에 반드시 다음 2가지를 포함하세요. 첫째: 💡 모델 추천: ${MODEL}. 현재 모델이 다르면 새 세션에서 ${CMD} 을 안내. 둘째: 이 작업은 복잡합니다. Plan Mode에서 먼저 계획을 세운 후 실행하는 것을 권장합니다."
-else
-  echo "IMPORTANT: 응답 첫 줄에 반드시 포함 → 💡 모델 추천: ${MODEL}. 현재 모델이 다르면 새 세션에서 ${CMD} 을 안내하세요."
+OUTPUT=""
+
+# 주제 변경 감지
+if echo "$LOWER" | grep -qiE '그건 됐고|이제 다른|다음으로|다른 작업|이건 끝|넘어가|다음 할|switch to|move on|next task|다른 거 하자'; then
+  OUTPUT="IMPORTANT: 주제가 바뀌었습니다. 반드시 안내하세요 → 새 작업이니 새 세션에서 시작하는 게 비용과 품질 모두 유리합니다. "
 fi
+
+# 모델 추천 + 복잡 작업 Plan Mode
+if [ "$COMPLEXITY" = "complex" ]; then
+  OUTPUT="${OUTPUT}IMPORTANT: 응답에 반드시 포함 → 💡 모델 추천: ${MODEL}. 현재 모델이 다르면 새 세션에서 ${CMD} 을 안내. 이 작업은 복잡합니다. Plan Mode에서 먼저 계획을 세운 후 실행하는 것을 권장합니다."
+else
+  OUTPUT="${OUTPUT}IMPORTANT: 응답 첫 줄에 반드시 포함 → 💡 모델 추천: ${MODEL}. 현재 모델이 다르면 새 세션에서 ${CMD} 을 안내하세요."
+fi
+
+echo "$OUTPUT"
 exit 0
