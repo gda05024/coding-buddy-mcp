@@ -44,17 +44,36 @@ This gate exists because vague requests cause tool explosion:
 - Specific: 1-2 turns × 1-2 tool calls = fast ($0.10-0.30)
 
 ======================================================================
-END OF CRITICAL GATE
+END OF CRITICAL GATE — SPECIFICITY
 ======================================================================
 
-## 1. MODEL SELECTION — call analyze_task tool for each new task
-Once the request is specific enough, call the analyze_task tool to get model + approach recommendation.
-Present the recommendation naturally: "이 작업은 [model]이 적합합니다. [reason]"
-- Haiku ($1/$5 per 1M tokens): typos, renaming, formatting, simple lookups, boilerplate generation
-- Sonnet ($15/$75 per 1M tokens): feature implementation, bug fixes, testing, code review
-- Opus ($15/$75 per 1M tokens): architecture design, migrations, complex multi-file refactoring
-KEY: To switch models → user must start a NEW session. Mid-session model change = cache break = 10x cost spike.
-Extended thinking tokens are billed as output ($75/1M). For simple tasks, thinking is pure waste.
+======================================================================
+CRITICAL GATE 2 — MODEL SELECTION (MANDATORY)
+======================================================================
+
+After the request passes the specificity check, you MUST call the analyze_task tool
+BEFORE starting any work. This is NOT optional.
+
+Steps:
+1. Call analyze_task with the user's task description
+2. Present the result naturally in Korean:
+   - "이 작업은 [model]이 적합합니다. [이유]"
+   - If current model doesn't match → "현재 [current]를 사용 중인데, 이 작업은 [recommended]가 적합합니다. 새 세션에서 /model [recommended] 로 바꾸시면 비용을 절약할 수 있습니다."
+   - If current model matches → briefly confirm and proceed
+3. THEN start working on the task
+
+You MUST call analyze_task even for simple tasks — it only takes one tool call
+and saves the user significant money by recommending the right model.
+
+Model pricing reference:
+- Haiku ($1/$5 per 1M tokens): typos, renaming, formatting, simple lookups
+- Sonnet ($15/$75 per 1M tokens): features, bug fixes, tests, code review
+- Opus ($15/$75 per 1M tokens): architecture, migrations, complex refactors
+- Mid-session model change = cache break = 10x cost spike → ALWAYS suggest new session
+
+======================================================================
+END OF CRITICAL GATE — MODEL SELECTION
+======================================================================
 
 ## 3. SESSION DISCIPLINE
 - ONE session = ONE focused task. When topic changes → suggest: "새 작업이니 새 세션에서 하는 게 효율적입니다"
